@@ -91,7 +91,7 @@ button{cursor:pointer;}
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
 import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, GoogleAuthProvider, signInWithPopup, signOut } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
-import { getFirestore, collection, addDoc, getDocs, doc, getDoc, setDoc, query, orderBy } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+import { getFirestore, collection, addDoc, getDocs, doc, setDoc, query, orderBy, onSnapshot } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
 
 /* Firebase初期化 */
 const firebaseConfig = { apiKey:"AIzaSyCdDf0GH80PoGlcbk2yjlaVQfP01Gk9m18", authDomain:"noteeditor-ba1db.firebaseapp.com", projectId:"noteeditor-ba1db" };
@@ -132,8 +132,6 @@ document.getElementById('google-login').onclick=async()=>{ try{ await signInWith
 userIcon.onclick=()=>{ userMenu.style.display=(userMenu.style.display==='block')?'none':'block'; }
 document.getElementById('switch-account').onclick=async()=>{ userMenu.style.display='none'; try{ await signInWithPopup(auth,provider); } catch(e){ showToast("切替失敗"); } }
 document.getElementById('logout-btn').onclick=()=>{ userMenu.style.display='none'; signOut(auth); location.hash='#login'; }
-
-/* 外部クリックでメニュー閉じる */
 document.addEventListener('click',e=>{
   if(!userMenu.contains(e.target) && e.target!==userIcon) userMenu.style.display='none';
   document.querySelectorAll('.menu-popup').forEach(menu=>{
@@ -149,14 +147,15 @@ onAuthStateChanged(auth, async user=>{
 });
 window.addEventListener('hashchange',()=>{ if(auth.currentUser) navigate(); });
 
-/* Load Memos (キャッシュ対応) */
+/* Firestoreキャッシュ + 右ボタン + Trash + プレビュー対応 */
+let unsubscribe=null;
 async function loadMemos(){
-  if(memosCache.length === 0){
-    const q=query(collection(db,'users',auth.currentUser.uid,'memos'), orderBy('updated','desc'));
-    const snap = await getDocs(q);
-    memosCache = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  }
-  renderMemos();
+  if(unsubscribe) unsubscribe(); // 古いlistener解除
+  const q=query(collection(db,'users',auth.currentUser.uid,'memos'), orderBy('updated','desc'));
+  unsubscribe = onSnapshot(q, snap=>{
+    memosCache = snap.docs.map(d=>({id:d.id,...d.data()}));
+    renderMemos();
+  });
 }
 
 function renderMemos(){
@@ -169,15 +168,30 @@ function renderMemos(){
     const rightDiv=document.createElement('div'); rightDiv.className='memo-right';
     const dateSpan=document.createElement('span'); dateSpan.className='date-span';
     dateSpan.textContent=new Date(data.updated).toLocaleString('ja-JP',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
-    rightDiv.append(dateSpan);
+    const menuBtn=document.createElement('button'); menuBtn.textContent='⋯'; menuBtn.className='menu-btn longpress-btn';
+    const menuPopup=document.createElement('div'); menuPopup.className='menu-popup';
+    const copyAction=document.createElement('button'); copyAction.textContent='Copy';
+    copyAction.onclick=async(e)=>{ e.stopPropagation(); navigator.clipboard.writeText(data.content||''); showToast('Copied'); menuPopup.style.display='none'; }
+    const deleteAction=document.createElement('button'); deleteAction.textContent='❌';
+    deleteAction.onclick=async(e)=>{ e.stopPropagation(); await setDoc(doc(db,'users',auth.currentUser.uid,'memos',data.id),{deletedAt:Date.now()},{merge:true}); showToast('Moved to Trash'); menuPopup.style.display='none'; }
+    menuPopup.append(copyAction,deleteAction);
+    menuBtn.onclick=(e)=>{ e.stopPropagation(); menuPopup.style.display=(menuPopup.style.display==='block')?'none':'block'; }
+    rightDiv.append(dateSpan,menuBtn,menuPopup);
     li.appendChild(rightDiv);
 
-    li.onclick=()=>openEditor(data.id);
+    /* 長押しプレビュー */
+    menuBtn.addEventListener('mousedown',()=>{ longPressTimer=setTimeout(()=>{ showPreview(data.id,data.title,data.content); },500); });
+    menuBtn.addEventListener('mouseup',()=>{ clearTimeout(longPressTimer); });
+    menuBtn.addEventListener('mouseleave',()=>{ clearTimeout(longPressTimer); });
+    menuBtn.addEventListener('touchstart',()=>{ longPressTimer=setTimeout(()=>{ showPreview(data.id,data.title,data.content); },500); });
+    menuBtn.addEventListener('touchend',()=>{ clearTimeout(longPressTimer); });
+
+    li.onclick=()=>location.hash=`#/editor/${data.id}`;
     memoList.appendChild(li);
   });
 }
 
-/* Trash */
+/* Trash表示 */
 function loadTrash(){
   const thirtyDaysAgo = Date.now() - 30*24*60*60*1000;
   const trashMemos = memosCache.filter(m => m.deletedAt && m.deletedAt > thirtyDaysAgo);
@@ -186,6 +200,15 @@ function loadTrash(){
     const li=document.createElement('li');
     const titleSpan=document.createElement('span'); titleSpan.className='memo-title'; titleSpan.textContent=data.title||'Untitled';
     li.appendChild(titleSpan);
+    const rightDiv=document.createElement('div'); rightDiv.className='memo-right';
+    const dateSpan=document.createElement('span'); dateSpan.className='date-span';
+    dateSpan.textContent=new Date(data.deletedAt).toLocaleString('ja-JP',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+    const restoreBtn=document.createElement('button'); restoreBtn.textContent='↩️';
+    restoreBtn.onclick=async(e)=>{ e.stopPropagation(); await setDoc(doc(db,'users',auth.currentUser.uid,'memos',data.id),{deletedAt:null},{merge:true}); showToast('Restored'); }
+    const deleteBtn=document.createElement('button'); deleteBtn.textContent='Delete';
+    deleteBtn.onclick=async(e)=>{ e.stopPropagation(); await setDoc(doc(db,'users',auth.currentUser.uid,'memos',data.id),{deletedAt:Date.now()-31*24*60*60*1000},{merge:true}); showToast('Deleted'); }
+    rightDiv.append(dateSpan,restoreBtn,deleteBtn);
+    li.appendChild(rightDiv);
     trashList.appendChild(li);
   });
 }
@@ -193,7 +216,7 @@ function loadTrash(){
 /* Editor */
 async function openEditor(id){
   currentMemoId=id;
-  const data = memosCache.find(m => m.id === id);
+  const data = memosCache.find(m=>m.id===id);
   if(!data) return;
   titleInput.value = data.title||'';
   editor.innerHTML = data.content||'';
@@ -207,39 +230,23 @@ async function saveMemo(){
   const title = titleInput.value.trim() || editor.innerText.split('\n')[0].trim() || '';
   const content = editor.innerHTML;
   const updated = Date.now();
-
-  const idx = memosCache.findIndex(m => m.id === currentMemoId);
-  if(idx >= 0) memosCache[idx] = { ...memosCache[idx], title, content, updated };
-
-  await setDoc(doc(db,'users',auth.currentUser.uid,'memos',currentMemoId), { title, content, updated }, { merge:true });
+  const idx = memosCache.findIndex(m=>m.id===currentMemoId);
+  if(idx>=0) memosCache[idx]={ ...memosCache[idx], title, content, updated };
+  await setDoc(doc(db,'users',auth.currentUser.uid,'memos',currentMemoId),{title,content,updated},{merge:true});
 }
 
-/* Paste処理（画像・YouTube・URL） */
+/* Paste処理 */
 editor.addEventListener('paste', e=>{
   e.preventDefault();
   const range=document.getSelection().getRangeAt(0);
   const items = e.clipboardData.items || [];
   const files = e.clipboardData.files || [];
-
-  for(const item of items){
-    if(item.type.startsWith('image/')){
-      const file=item.getAsFile();
-      const reader=new FileReader();
-      reader.onload=()=>{ const img=document.createElement('img'); img.src=reader.result; range.insertNode(img); range.collapse(false); saveMemo(); }
-      reader.readAsDataURL(file); return;
-    }
-  }
-  if(files.length>0 && files[0].type.startsWith('image/')){
-    const reader=new FileReader();
-    reader.onload=()=>{ const img=document.createElement('img'); img.src=reader.result; range.insertNode(img); range.collapse(false); saveMemo(); }
-    reader.readAsDataURL(files[0]); return;
-  }
-
+  for(const item of items){ if(item.type.startsWith('image/')){ const file=item.getAsFile(); const reader=new FileReader(); reader.onload=()=>{ const img=document.createElement('img'); img.src=reader.result; range.insertNode(img); range.collapse(false); saveMemo(); }; reader.readAsDataURL(file); return; } }
+  if(files.length>0 && files[0].type.startsWith('image/')){ const reader=new FileReader(); reader.onload=()=>{ const img=document.createElement('img'); img.src=reader.result; range.insertNode(img); range.collapse(false); saveMemo(); }; reader.readAsDataURL(files[0]); return; }
   const text = e.clipboardData.getData('text/plain');
   const yt=text.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)/);
   if(yt){ const wrap=document.createElement('div'); wrap.className='video'; const iframe=document.createElement('iframe'); iframe.src=`https://www.youtube-nocookie.com/embed/${yt[1]}?modestbranding=1&rel=0&playsinline=1`; iframe.allowFullscreen=true; wrap.appendChild(iframe); range.insertNode(wrap); range.collapse(false); saveMemo(); return; }
-  const urlRegex=/https?:\/\/\S+\.(?:png|jpg|jpeg|gif)/i; const m=text.match(urlRegex);
-  if(m){ const img=document.createElement('img'); img.src=m[0]; range.insertNode(img); range.collapse(false); saveMemo(); return; }
+  const urlRegex=/https?:\/\/\S+\.(?:png|jpg|jpeg|gif)/i; const m=text.match(urlRegex); if(m){ const img=document.createElement('img'); img.src=m[0]; range.insertNode(img); range.collapse(false); saveMemo(); return; }
   range.insertNode(document.createTextNode(text)); range.collapse(false); saveMemo();
 });
 
@@ -249,11 +256,8 @@ function showPreview(id,title,content){
   preview.style.display='block';
   copyBtn.onclick=()=>{ navigator.clipboard.writeText(content||''); showToast('Copied'); }
   deleteBtn.onclick=async()=>{
-    const idx = memosCache.findIndex(m=>m.id===id);
-    if(idx>=0) memosCache[idx].deletedAt = Date.now();
     await setDoc(doc(db,'users',auth.currentUser.uid,'memos',id),{deletedAt:Date.now()},{merge:true});
     preview.style.display='none';
-    renderMemos();
     showToast('Moved to Trash');
   }
   closePreview.onclick=()=>preview.style.display='none';
@@ -274,9 +278,13 @@ async function navigate(){
   const hash=location.hash;
   if(hash.startsWith('#/editor/')) { await openEditor(hash.split('/')[2]); }
   else if(hash==='#/list' || hash==='') { show('list'); await loadMemos(); }
-  else if(hash==='#trash') { show('trash'); loadTrash(); }
+  else if(hash==='#/trash') { show('trash'); loadTrash(); }
   else if(hash==='#login') show('login');
 }
+
+/* 初期化 */
+navigate();
 </script>
 </body>
 </html>
+  
